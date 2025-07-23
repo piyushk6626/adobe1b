@@ -156,8 +156,7 @@ def generate_with_retry(input_text: str, max_retries: int = 3) -> Tuple[Optional
 
 def process_persona_combination(main_persona: str, sub_persona: str) -> Tuple[str, str, Optional[str], bool]:
     """Process a single main_persona + sub_persona combination"""
-    # For keys-only processing, use just the main_persona as input
-    input_text = main_persona
+    input_text = f"{main_persona}: {sub_persona}"
     result, success = generate_with_retry(input_text)
     
     if success and result:
@@ -189,13 +188,13 @@ def main():
     
     persona_list = get_persona_list()
     
-    # Create list of main personas only (keys-only processing)
+    # Create list of all persona combinations
     persona_combinations = []
-    for main_persona in persona_list.keys():
-        # Use the same value for both main_persona and sub_persona
-        persona_combinations.append((main_persona, main_persona))
+    for main_persona, sub_personas in persona_list.items():
+        for sub_persona in sub_personas:
+            persona_combinations.append((main_persona, sub_persona))
     
-    logger.info(f"Starting processing of {len(persona_combinations)} main personas (keys-only) using ThreadPoolExecutor...")
+    logger.info(f"Starting processing of {len(persona_combinations)} persona combinations using ThreadPoolExecutor...")
     
     # Use ThreadPoolExecutor for parallel processing
     max_workers = 10  # Increased from 10 for better parallelism
@@ -223,12 +222,11 @@ def main():
                 if success:
                     if main_persona_result not in success_data:
                         success_data[main_persona_result] = []
-                    # Add the main_persona as a value in its own key's list
-                    success_data[main_persona_result].append(main_persona_result)
+                    success_data[main_persona_result].append(sub_persona_result)
                 else:
                     if main_persona_result not in failed_data:
                         failed_data[main_persona_result] = []
-                    failed_data[main_persona_result].append(main_persona_result)
+                    failed_data[main_persona_result].append(sub_persona_result)
                 
                 # Progress logging
                 if completed_count % 10 == 0:
@@ -243,34 +241,13 @@ def main():
                 logger.error(f"Task failed with exception for {main_persona}:{sub_persona}: {e}")
                 if main_persona not in failed_data:
                     failed_data[main_persona] = []
-                failed_data[main_persona].append(main_persona)
-    
-    # Load existing success.json if it exists and merge with new results
-    existing_success_data = {}
-    if os.path.exists("success.json"):
-        try:
-            with open("success.json", "r", encoding="utf-8") as f:
-                existing_success_data = json.load(f)
-            logger.info("Loaded existing success.json for merging")
-        except Exception as e:
-            logger.error(f"Failed to load existing success.json: {str(e)}")
-    
-    # Merge existing data with new results
-    for main_persona, sub_personas in success_data.items():
-        if main_persona in existing_success_data:
-            # Append new results to existing list, avoiding duplicates
-            existing_list = existing_success_data[main_persona]
-            for sub_persona in sub_personas:
-                if sub_persona not in existing_list:
-                    existing_list.append(sub_persona)
-        else:
-            existing_success_data[main_persona] = sub_personas
+                failed_data[main_persona].append(sub_persona)
     
     # Save success and failed tracking files
     try:
         with open("success.json", "w", encoding="utf-8") as f:
-            json.dump(existing_success_data, f, indent=2, ensure_ascii=False)
-        logger.info(f"Saved {len(existing_success_data)} successful main personas to success.json")
+            json.dump(success_data, f, indent=2, ensure_ascii=False)
+        logger.info(f"Saved {len(success_data)} successful main personas to success.json")
         
         with open("failed.json", "w", encoding="utf-8") as f:
             json.dump(failed_data, f, indent=2, ensure_ascii=False)
