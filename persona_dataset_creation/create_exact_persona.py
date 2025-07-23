@@ -1,8 +1,10 @@
-import asyncio
 import json
 import os
 import logging
+import time
 from typing import Dict, List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -10,6 +12,9 @@ from dotenv import load_dotenv
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Thread-safe lock for file operations
+file_lock = Lock()
 
 SYSTEM_PROMPT = """
 # Identity
@@ -101,7 +106,7 @@ def safe_filename(text: str) -> str:
     """Convert text to safe filename format"""
     return text.replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "").replace(",", "").replace("&", "and").replace("-", "_")
 
-async def generate_with_retry(input_text: str, max_retries: int = 3) -> Tuple[Optional[str], bool]:
+def generate_with_retry(input_text: str, max_retries: int = 3) -> Tuple[Optional[str], bool]:
     """Generate content with retry mechanism and model fallback"""
     client = get_gemini_client()
     models = ["gemini-2.5-pro", "gemini-2.5-flash"]
@@ -145,98 +150,146 @@ async def generate_with_retry(input_text: str, max_retries: int = 3) -> Tuple[Op
             if attempt == max_retries - 1:
                 logger.error(f"All retries failed for: {input_text[:50]}...")
                 return None, False
-            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+            time.sleep(2 ** attempt)  # Exponential backoff
     
     return None, False
 
-async def process_persona_combination(main_persona: str, sub_persona: str, semaphore: asyncio.Semaphore) -> Tuple[str, str, Optional[str], bool]:
-    """Process a single main_persona + sub_persona combination with concurrency control"""
-    async with semaphore:  # Limit concurrent executions
-        input_text = f"{main_persona}: {sub_persona}"
-        result, success = await generate_with_retry(input_text)
+def process_persona_combination(main_persona: str, sub_persona: str) -> Tuple[str, str, Optional[str], bool]:
+    """Process a single main_persona + sub_persona combination"""
+    # For keys-only processing, use just the main_persona as input
+    input_text = main_persona
+    result, success = generate_with_retry(input_text)
+    
+    if success and result:
+        # Save individual result with thread-safe file operations
+        filename = f"{safe_filename(main_persona)}_{safe_filename(sub_persona)}.json"
+        persona_data = {
+            "main_persona": main_persona,
+            "sub_persona": sub_persona,
+            "details": result
+        }
         
-        if success and result:
-            # Save individual result
-            filename = f"{safe_filename(main_persona)}_{safe_filename(sub_persona)}.json"
-            persona_data = {
-                "main_persona": main_persona,
-                "sub_persona": sub_persona,
-                "details": result
-            }
-            
-            try:
+        try:
+            with file_lock:  # Thread-safe file writing
                 with open(f"results/{filename}", "w", encoding="utf-8") as f:
                     json.dump(persona_data, f, indent=2, ensure_ascii=False)
-                logger.info(f"Saved result to results/{filename}")
-            except Exception as e:
-                logger.error(f"Failed to save result to results/{filename}: {str(e)}")
-        
-        return main_persona, sub_persona, result, success
+            logger.info(f"Saved result to results/{filename}")
+        except Exception as e:
+            logger.error(f"Failed to save result to results/{filename}: {str(e)}")
+    
+    return main_persona, sub_persona, result, success
 
-async def create_results_directory():
+def create_results_directory():
     """Create results directory if it doesn't exist"""
     if not os.path.exists("results"):
         os.makedirs("results")
 
-async def main():
-    await create_results_directory()
+def main():
+    create_results_directory()
     
     persona_list = get_persona_list()
     
-    # Create semaphore to limit concurrent tasks to 10
-    semaphore = asyncio.Semaphore(10)
+    # Create list of main personas only (keys-only processing)
+    persona_combinations = []
+    for main_persona in persona_list.keys():
+        # Use the same value for both main_persona and sub_persona
+        persona_combinations.append((main_persona, main_persona))
     
-    # Create list of all persona combinations
-    tasks = []
-    for main_persona, sub_personas in persona_list.items():
-        for sub_persona in sub_personas:
-            task = process_persona_combination(main_persona, sub_persona, semaphore)
-            tasks.append(task)
+    logger.info(f"Starting processing of {len(persona_combinations)} main personas (keys-only) using ThreadPoolExecutor...")
     
-    logger.info(f"Starting processing of {len(tasks)} persona combinations with max 10 concurrent tasks...")
-    
-    # Run all tasks in parallel with concurrency limit
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Separate successful and failed results
+    # Use ThreadPoolExecutor for parallel processing
+    max_workers = 10  # Increased from 10 for better parallelism
     success_data = {}
     failed_data = {}
     
-    for result in results:
-        if isinstance(result, Exception):
-            logger.error(f"Task failed with exception: {result}")
-            continue
-            
-        main_persona, sub_persona, content, success = result
+    start_time = time.time()
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_persona = {
+            executor.submit(process_persona_combination, main_persona, sub_persona): (main_persona, sub_persona)
+            for main_persona, sub_persona in persona_combinations
+        }
         
-        if success:
-            if main_persona not in success_data:
-                success_data[main_persona] = []
-            success_data[main_persona].append(sub_persona)
+        # Process completed tasks as they finish
+        completed_count = 0
+        for future in as_completed(future_to_persona):
+            main_persona, sub_persona = future_to_persona[future]
+            completed_count += 1
+            
+            try:
+                main_persona_result, sub_persona_result, content, success = future.result()
+                
+                if success:
+                    if main_persona_result not in success_data:
+                        success_data[main_persona_result] = []
+                    # Add the main_persona as a value in its own key's list
+                    success_data[main_persona_result].append(main_persona_result)
+                else:
+                    if main_persona_result not in failed_data:
+                        failed_data[main_persona_result] = []
+                    failed_data[main_persona_result].append(main_persona_result)
+                
+                # Progress logging
+                if completed_count % 10 == 0:
+                    elapsed_time = time.time() - start_time
+                    rate = completed_count / elapsed_time
+                    remaining = len(persona_combinations) - completed_count
+                    eta = remaining / rate if rate > 0 else 0
+                    logger.info(f"Progress: {completed_count}/{len(persona_combinations)} completed. "
+                              f"Rate: {rate:.2f} tasks/sec. ETA: {eta/60:.1f} minutes")
+                    
+            except Exception as e:
+                logger.error(f"Task failed with exception for {main_persona}:{sub_persona}: {e}")
+                if main_persona not in failed_data:
+                    failed_data[main_persona] = []
+                failed_data[main_persona].append(main_persona)
+    
+    # Load existing success.json if it exists and merge with new results
+    existing_success_data = {}
+    if os.path.exists("success.json"):
+        try:
+            with open("success.json", "r", encoding="utf-8") as f:
+                existing_success_data = json.load(f)
+            logger.info("Loaded existing success.json for merging")
+        except Exception as e:
+            logger.error(f"Failed to load existing success.json: {str(e)}")
+    
+    # Merge existing data with new results
+    for main_persona, sub_personas in success_data.items():
+        if main_persona in existing_success_data:
+            # Append new results to existing list, avoiding duplicates
+            existing_list = existing_success_data[main_persona]
+            for sub_persona in sub_personas:
+                if sub_persona not in existing_list:
+                    existing_list.append(sub_persona)
         else:
-            if main_persona not in failed_data:
-                failed_data[main_persona] = []
-            failed_data[main_persona].append(sub_persona)
+            existing_success_data[main_persona] = sub_personas
     
     # Save success and failed tracking files
     try:
         with open("success.json", "w", encoding="utf-8") as f:
-            json.dump(success_data, f, indent=2, ensure_ascii=False)
-        logger.info(f"Saved {len(success_data)} successful main personas to success.json")
+            json.dump(existing_success_data, f, indent=2, ensure_ascii=False)
+        logger.info(f"Saved {len(existing_success_data)} successful main personas to success.json")
         
         with open("failed.json", "w", encoding="utf-8") as f:
             json.dump(failed_data, f, indent=2, ensure_ascii=False)
         logger.info(f"Saved {len(failed_data)} failed main personas to failed.json")
         
-        # Log summary
+        # Log final summary
         total_success = sum(len(subs) for subs in success_data.values())
         total_failed = sum(len(subs) for subs in failed_data.values())
-        logger.info(f"Processing complete - Success: {total_success}, Failed: {total_failed}")
+        total_time = time.time() - start_time
+        average_rate = len(persona_combinations) / total_time
+        
+        logger.info(f"Processing complete in {total_time/60:.1f} minutes!")
+        logger.info(f"Success: {total_success}, Failed: {total_failed}")
+        logger.info(f"Average rate: {average_rate:.2f} tasks/sec")
         
     except Exception as e:
         logger.error(f"Failed to save tracking files: {str(e)}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
 
 
