@@ -1,0 +1,8 @@
+PyMuPDF
+Pillow
+shapely
+torch
+torch_geometric
+numpy
+networkx
+scipy
